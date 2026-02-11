@@ -1,0 +1,13 @@
+[project]
+name = "droidcalib"
+version = "0.1.0"
+description = "DroidCalib — DROID 数据集标定质量筛选工具"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy>=1.26,<2",
+    "scipy>=1.12",
+    "mujoco>=3.4",
+    "opencv-python>=4.10",
+    "tensorflow>=2.18",
+    "tensorflow-datasets>=4.9",
+]

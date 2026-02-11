@@ -1,0 +1,19 @@
+# DROID 数据集 (2.1G tfrecord)
+droid_100/
+
+# 标定 JSON 文件 (336M)
+calibration/*.json
+
+# 标定 notebook 缓存
+calibration/.cache/
+
+# 采样图片
+samples/
+
+# 运行结果与可视化
+calib_filter/results/
+calib_filter/__pycache__/
+
+# uv 虚拟环境与锁文件
+.venv/
+uv.lock
