@@ -3,24 +3,17 @@
 
 How it works
 ------------
-We can't do pixel-wise comparison because the rendered image only has a white
-robot on a checkerboard floor, while the real image has a complex scene. Instead
-we use 5 proxy signals that together indicate whether the rendered robot mask
-lands on the actual robot in the real image.
+The primary signal is FK keypoint appearance: project robot joint positions
+onto the real image and check if they land on bright, desaturated surfaces
+(Franka Panda is white). This directly measures "are the joints where the
+calibration says they are?"
 
-Scoring weights (tweak these to change behavior):
-
-    WEIGHTS = {
-        'edge':       0.30,  # rendered contour aligns with real edges
-        'gradient':   0.25,  # edge direction matches in mask region
-        'brightness': 0.20,  # mask region is brighter (Franka is white)
-        'texture':    0.15,  # mask region has texture (not empty background)
-        'coverage':   0.10,  # robot is visible in frame (not off-screen)
-    }
+Secondary signals from rendered mask comparison provide additional context:
+edge alignment, gradient consistency, brightness contrast, texture.
 
 Typical scores:
-    0.80+ = good alignment, calibration is reliable
-    0.50~0.70 = rough alignment, usable with caution
+    0.75+ = good alignment, calibration is reliable
+    0.45~0.75 = rough alignment, usable with caution
     < 0.40 = clearly off, calibration is bad or cam2cam chain drifted
 """
 
@@ -33,11 +26,12 @@ import cv2
 # aspects. They should sum to 1.0.
 # ──────────────────────────────────────────────────────────────────────
 WEIGHTS = {
-    'edge':       0.30,
-    'gradient':   0.25,
-    'brightness': 0.20,
-    'texture':    0.15,
-    'coverage':   0.10,
+    'keypoint':   0.40,  # FK keypoints land on robot (bright + desaturated)
+    'edge':       0.25,  # rendered contour aligns with real edges
+    'gradient':   0.15,  # edge direction matches in mask region
+    'brightness': 0.10,  # mask region is brighter (Franka is white)
+    'texture':    0.05,  # mask region has texture (not empty background)
+    'coverage':   0.05,  # robot is visible in frame (not off-screen)
 }
 
 # If rendered robot covers less than this fraction of the image,
@@ -57,10 +51,78 @@ BRIGHT_STD_SCALE = 0.5    # how much weight for inner region variance
 # texture_presence: local variance normalization
 TEXTURE_NORM = 500.0       # variance value that maps to score=1.0
 
+# keypoint_appearance: local patch analysis around FK joints
+KP_PATCH_RADIUS = 12       # pixels around each keypoint to sample
+KP_BRIGHT_FLOOR = 100.0    # brightness below this scores 0
+KP_BRIGHT_RANGE = 100.0    # brightness range that maps 0→1 (floor+range = full score)
+KP_SAT_CEIL = 100.0        # saturation value that maps to 0.0 (fully colorful)
+KP_GRAD_NORM = 25.0        # gradient magnitude that maps to 1.0
+KP_TOP_RATIO = 0.6         # average top 60% of keypoints (ignore gripper/base)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Individual metrics
 # ──────────────────────────────────────────────────────────────────────
+
+def keypoint_appearance_score(real_image, fk_points):
+    """Check if FK keypoints land on robot-like surfaces.
+
+    Franka Panda is white/light gray with low color saturation and 3D shape.
+    For each projected joint, extract a local patch and check:
+      - absolute brightness (robot body is white, ~160-230)
+      - color saturation (robot is desaturated, not colorful)
+      - local gradient (robot is 3D with edges, not flat background)
+
+    Uses top-K averaging: the worst-scoring joints (gripper, base, orange
+    covers) are excluded so they don't drag down the metric.
+    """
+    if not fk_points:
+        return 0.0
+
+    h, w = real_image.shape[:2]
+    gray = cv2.cvtColor(real_image, cv2.COLOR_RGB2GRAY) if real_image.ndim == 3 else real_image
+    hsv = cv2.cvtColor(real_image, cv2.COLOR_RGB2HSV) if real_image.ndim == 3 else None
+    r = KP_PATCH_RADIUS
+
+    scores = []
+    for item in fk_points:
+        px, py = item[0], item[1]
+
+        y0, y1 = max(0, py - r), min(h, py + r + 1)
+        x0, x1 = max(0, px - r), min(w, px + r + 1)
+        if y1 - y0 < 5 or x1 - x0 < 5:
+            continue
+
+        patch_gray = gray[y0:y1, x0:x1]
+        patch_f32 = patch_gray.astype(np.float32)
+
+        # Brightness: absolute threshold (Franka body is white)
+        bright_score = np.clip(
+            (patch_gray.mean() - KP_BRIGHT_FLOOR) / KP_BRIGHT_RANGE, 0, 1)
+
+        # Saturation: low = white/gray (Franka), high = colorful (table, objects)
+        if hsv is not None:
+            patch_sat = hsv[y0:y1, x0:x1, 1]
+            sat_score = np.clip(1.0 - patch_sat.mean() / KP_SAT_CEIL, 0, 1)
+        else:
+            sat_score = 0.5
+
+        # Structure: local gradient (3D robot has edges, flat wall doesn't)
+        gx = cv2.Sobel(patch_f32, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(patch_f32, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx**2 + gy**2).mean()
+        struct_score = np.clip(grad_mag / KP_GRAD_NORM, 0, 1)
+
+        scores.append(0.35 * bright_score + 0.40 * sat_score + 0.25 * struct_score)
+
+    if not scores:
+        return 0.0
+
+    # Top-K: ignore worst-scoring joints (gripper, base, orange covers)
+    scores.sort(reverse=True)
+    n_top = max(1, int(len(scores) * KP_TOP_RATIO))
+    return float(np.mean(scores[:n_top]))
+
 
 def edge_alignment_score(real_image, rendered_mask):
     """How well the rendered contour sits on real image edges.
@@ -196,36 +258,39 @@ def texture_presence_score(real_image, rendered_mask):
 # Overall score
 # ──────────────────────────────────────────────────────────────────────
 
-def evaluate_calibration_quality(real_image, rendered_image, rendered_mask):
+def evaluate_calibration_quality(real_image, rendered_image, rendered_mask, fk_points=None):
     """Compute all metrics and weighted overall score.
 
     Args:
-        real_image:    (H, W, 3) uint8 RGB from DROID
+        real_image:     (H, W, 3) uint8 RGB from DROID
         rendered_image: (H, W, 3) uint8 RGB from MuJoCo
         rendered_mask:  (H, W) uint8, 255=robot
+        fk_points:      list of (px, py, name) from project_fk_joints
 
     Returns:
         dict with individual scores and 'overall_score'
     """
     coverage = float((rendered_mask > 128).sum() / rendered_mask.size) if rendered_mask.size > 0 else 0.0
+    keypoint = keypoint_appearance_score(real_image, fk_points or [])
     edge = edge_alignment_score(real_image, rendered_mask)
     gradient = gradient_consistency_score(real_image, rendered_image, rendered_mask)
     brightness = brightness_contrast_score(real_image, rendered_mask)
     texture = texture_presence_score(real_image, rendered_mask)
 
     if coverage < MIN_COVERAGE:
-        # Robot barely visible => calibration probably way off
-        overall = coverage * 20  # caps at ~0.1
+        overall = coverage * 20
     else:
         overall = (
+            WEIGHTS['keypoint'] * keypoint +
             WEIGHTS['edge'] * edge +
             WEIGHTS['gradient'] * gradient +
             WEIGHTS['brightness'] * brightness +
             WEIGHTS['texture'] * texture +
-            WEIGHTS['coverage'] * min(coverage * 5, 1.0)  # saturates at 20% coverage
+            WEIGHTS['coverage'] * min(coverage * 5, 1.0)
         )
 
     return {
+        'keypoint_appearance': keypoint,
         'edge_alignment': edge,
         'gradient_consistency': gradient,
         'brightness_contrast': brightness,

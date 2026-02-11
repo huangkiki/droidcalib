@@ -113,7 +113,10 @@ def _extract_joints(step):
     return full
 
 
-def process_episode(episode_idx, episode, calib, renderer, save_vis=False, sample_steps=3):
+TOP_K_FRAMES = 5  # average the top-K frames by robot visibility
+
+
+def process_episode(episode_idx, episode, calib, renderer, save_vis=False, sample_steps=15):
     file_path = episode['episode_metadata']['file_path'].numpy().decode('utf-8')
     rel_path = file_path.split('r2d2-data-full/')[-1] if 'r2d2-data-full/' in file_path else file_path
     lab = rel_path.split('/')[0]
@@ -138,10 +141,13 @@ def process_episode(episode_idx, episode, calib, renderer, save_vis=False, sampl
     n_steps = len(steps)
     result['n_steps'] = n_steps
 
-    if sample_steps >= n_steps:
-        step_indices = list(range(n_steps))
+    # Evenly spaced sample across the episode (skip first/last 10%)
+    margin = max(1, n_steps // 10)
+    usable = n_steps - 2 * margin
+    if usable <= 0 or sample_steps >= usable:
+        step_indices = list(range(margin, n_steps - margin))
     else:
-        step_indices = [0, n_steps // 2, n_steps - 1][:sample_steps]
+        step_indices = [margin + int(i * usable / sample_steps) for i in range(sample_steps)]
 
     mid_step = steps[n_steps // 2]
 
@@ -173,20 +179,24 @@ def process_episode(episode_idx, episode, calib, renderer, save_vis=False, sampl
                     output_width=real_w,
                     output_height=real_h,
                 )
-                cam_scores.append(evaluate_calibration_quality(real_img, rgb, mask))
+                fk_pts = renderer.project_fk_joints(
+                    params['intrinsics'], params['extrinsics'],
+                    params['calib_width'], params['calib_height'],
+                    real_w, real_h,
+                )
+                cam_scores.append(evaluate_calibration_quality(real_img, rgb, mask, fk_pts))
             except Exception as e:
                 cam_scores.append({
-                    'edge_alignment': 0, 'gradient_consistency': 0,
-                    'brightness_contrast': 0, 'texture_presence': 0,
-                    'mask_coverage': 0, 'overall_score': 0,
-                    'error': str(e),
+                    'keypoint_appearance': 0, 'edge_alignment': 0,
+                    'gradient_consistency': 0, 'brightness_contrast': 0,
+                    'texture_presence': 0, 'mask_coverage': 0,
+                    'overall_score': 0, 'error': str(e),
                 })
 
-        # Only average over frames where the robot is actually visible
-        valid_scores = [s for s in cam_scores
-                        if 'error' not in s and s.get('mask_coverage', 0) >= 0.005]
-        if not valid_scores:
-            valid_scores = [s for s in cam_scores if 'error' not in s]
+        # Pick the top-K frames by robot visibility (mask_coverage), then average
+        valid_scores = [s for s in cam_scores if 'error' not in s]
+        valid_scores.sort(key=lambda s: s.get('mask_coverage', 0), reverse=True)
+        valid_scores = valid_scores[:TOP_K_FRAMES]
 
         if valid_scores:
             avg_metrics = {}
@@ -362,7 +372,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DroidCalib')
     parser.add_argument('--save-vis', action='store_true', help='save visualization images')
     parser.add_argument('--max-episodes', type=int, default=None, help='max episodes to process')
-    parser.add_argument('--sample-steps', type=int, default=3, help='steps to sample per episode')
+    parser.add_argument('--sample-steps', type=int, default=15, help='candidate frames to sample (top 5 by visibility are scored)')
     args = parser.parse_args()
 
     run_batch(
