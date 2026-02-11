@@ -25,7 +25,7 @@ fi
 # --------------------------------------------------
 # 2. DROID 标定文件 (~340MB)
 # --------------------------------------------------
-CALIB_BASE="https://github.com/droid-dataset/droid/raw/main"
+CALIB_BASE="https://huggingface.co/KarlP/droid/resolve/main"
 CALIB_FILES=(
     "cam2base_extrinsics.json"
     "cam2cam_extrinsics.json"
@@ -37,7 +37,7 @@ CALIB_FILES=(
 mkdir -p calibration
 NEED_CALIB=0
 for f in "${CALIB_FILES[@]}"; do
-    [ -f "calibration/$f" ] || NEED_CALIB=1
+    [ -f "calibration/$f" ] && [ -s "calibration/$f" ] || NEED_CALIB=1
 done
 
 if [ "$NEED_CALIB" -eq 0 ]; then
@@ -45,7 +45,7 @@ if [ "$NEED_CALIB" -eq 0 ]; then
 else
     echo "[2/2] 下载 DROID 标定文件 (~340MB)..."
     for f in "${CALIB_FILES[@]}"; do
-        if [ ! -f "calibration/$f" ]; then
+        if [ ! -f "calibration/$f" ] || [ ! -s "calibration/$f" ]; then
             echo "  下载 $f ..."
             curl -fSL -o "calibration/$f" "${CALIB_BASE}/${f}" 2>/dev/null \
                 || wget -q -O "calibration/$f" "${CALIB_BASE}/${f}" \
