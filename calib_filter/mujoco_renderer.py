@@ -14,7 +14,7 @@ from scipy.spatial.transform import Rotation
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SCENE_XML = _PROJECT_ROOT / "franka_model" / "scene_with_cam.xml"
+DEFAULT_SCENE_XML = _PROJECT_ROOT / "franka_model" / "scene.xml"
 
 _CV2MJ = np.diag([1.0, -1.0, -1.0])
 
@@ -39,12 +39,12 @@ class FrankaRenderer:
 
     def __init__(self, model_path=None):
         model_path = model_path or str(DEFAULT_SCENE_XML)
-        self.model = mujoco.MjModel.from_xml_path(model_path)
+        spec = mujoco.MjSpec.from_file(model_path)
+        spec.worldbody.add_camera(name='ext_cam', pos=[0, 0, 1], quat=[1, 0, 0, 0], fovy=60)
+        self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
 
         self._cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, 'ext_cam')
-        if self._cam_id < 0:
-            raise RuntimeError("Model must have a camera named 'ext_cam'")
 
         self._renderers = {}
         self._floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, 'floor')
